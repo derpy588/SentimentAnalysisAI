@@ -4,12 +4,21 @@ from torch import nn, optim
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from transformers import DistilBertTokenizer
-from model import SentimentClassifier
-from SentimentDataset import get_data_loader
+from model import SentimentClassifier # Assuming model.py contains SentimentClassifier
+from SentimentDataset import get_data_loader # Assuming SentimentDataset.py contains get_data_loader
 import numpy as np
 import json
 import pandas as pd
 import time # Import the time module
+
+# Import DirectML backend if available
+_directml_available = False
+try:
+    import torch.backends.directml
+    _directml_available = torch.backends.directml.is_available()
+except ImportError:
+    _directml_available = False
+    print("Warning: torch_directml not installed. DirectML backend will not be available.")
 
 class SentimentAnalysisSystem:
     """
@@ -20,6 +29,7 @@ class SentimentAnalysisSystem:
     - Inference
     - Visualization
     - Configuration management
+    - Device management (CPU, CUDA, DirectML)
     """
     def __init__(self, model_config=None):
         """
@@ -61,7 +71,11 @@ class SentimentAnalysisSystem:
         self.tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
         print(f"Vocabulary Size: {self.tokenizer.vocab_size}")
 
-        # Initialize the model
+        # Initialize device (will be set later by detect_and_set_device)
+        self.device = torch.device("cpu")
+        print(f"Initial device set to: {self.device}")
+
+        # Initialize the model (will be moved to the selected device later)
         self._initialize_model()
 
         # Prepare data loaders if files exist
@@ -75,7 +89,7 @@ class SentimentAnalysisSystem:
         self.val_accuracies = []
 
     def _initialize_model(self):
-        """Initialize or reinitialize the model with current configuration."""
+        """Initialize or reinitialize the model with current configuration and move to device."""
         # Initialize the model
         self.model = SentimentClassifier(
             vocab_size=self.tokenizer.vocab_size,
@@ -86,6 +100,10 @@ class SentimentAnalysisSystem:
             dropout_rate=self.config['dropout_rate'],
             use_attention=self.config['use_attention']
         )
+
+        # Move model to the currently set device
+        self.model.to(self.device)
+        print(f"Model moved to device: {self.device}")
 
         # Print model information
         total_params = sum(p.numel() for p in self.model.parameters())
@@ -98,10 +116,76 @@ class SentimentAnalysisSystem:
             lr=self.config['learning_rate']
         )
 
+    def detect_available_devices(self):
+        """
+        Detect available computation devices (CPU, CUDA, DirectML).
+
+        Returns:
+            list: A list of available device names (e.g., ['cpu', 'cuda', 'dml']).
+        """
+        # Declare _directml_available as global to access the module-level variable
+        global _directml_available
+
+        available_devices = ["cpu"] # CPU is always available
+
+        if torch.cuda.is_available():
+            available_devices.append("cuda")
+            print(f"CUDA available: {torch.cuda.device_count()} device(s)")
+
+        if _directml_available:
+            # DirectML devices are typically indexed starting from 0
+            try:
+                # Check if any DirectML device is actually initialized
+                dml_device_count = torch.backends.directml.device_count()
+                if dml_device_count > 0:
+                     available_devices.append("dml")
+                     print(f"DirectML available: {dml_device_count} device(s)")
+            except Exception as e:
+                 print(f"Error checking DirectML devices: {e}")
+                 _directml_available = False # Disable DML if there's an error
+
+        # Note: ZLUDA support is less direct in PyTorch. It often works by
+        # intercepting CUDA calls. If ZLUDA is set up correctly, it *might*
+        # appear as a CUDA device. Explicit ZLUDA detection beyond checking
+        # CUDA availability is not standard in PyTorch's device API.
+
+        return available_devices
+
+    def set_device(self, device_name):
+        """
+        Set the computation device for the system.
+
+        Args:
+            device_name (str): The name of the device ('cpu', 'cuda', 'dml').
+        """
+        # Declare _directml_available as global to access the module-level variable
+        global _directml_available
+
+        if device_name == "cuda" and not torch.cuda.is_available():
+            print("Error: CUDA is not available on this system. Setting device to CPU.")
+            self.device = torch.device("cpu")
+        elif device_name == "dml" and not _directml_available:
+             print("Error: DirectML is not available on this system. Setting device to CPU.")
+             self.device = torch.device("cpu")
+        elif device_name not in ["cpu", "cuda", "dml"]:
+             print(f"Warning: Unknown device '{device_name}'. Setting device to CPU.")
+             self.device = torch.device("cpu")
+        else:
+            self.device = torch.device(device_name)
+
+        # Move the model to the newly set device
+        self.model.to(self.device)
+        print(f"Computation device set to: {self.device}")
+
+
     def save_config(self):
         """Save the current configuration to a JSON file."""
+        # Exclude device information as it's system-specific
+        config_to_save = self.config.copy()
+        # No need to explicitly remove device as it's not in self.config initially
+
         with open(self.config['config_save_path'], 'w') as f:
-            json.dump(self.config, f, indent=4)
+            json.dump(config_to_save, f, indent=4)
         print(f"Configuration saved to {self.config['config_save_path']}")
 
     def load_config(self, config_path=None):
@@ -121,6 +205,7 @@ class SentimentAnalysisSystem:
             print(f"Configuration loaded from {config_path}")
 
             # Reinitialize model with the loaded configuration
+            # Model will be moved to the *currently set* device in _initialize_model
             self._initialize_model()
 
             # Reload data loaders
@@ -208,6 +293,7 @@ class SentimentAnalysisSystem:
                 print(f"Updated class information: {num_classes} classes found")
 
                 # Reinitialize the model with updated number of classes
+                # Model will be moved to the currently set device in _initialize_model
                 self._initialize_model()
             else:
                 print(f"Label column '{self.config['label_column']}' not found in dataset.")
@@ -228,7 +314,7 @@ class SentimentAnalysisSystem:
             return None
 
         print(f"\n{'='*60}")
-        print(f"Starting training for {epochs} epochs")
+        print(f"Starting training for {epochs} epochs on device: {self.device}")
         print(f"{'='*60}")
 
         best_val_loss = float('inf')
@@ -250,6 +336,9 @@ class SentimentAnalysisSystem:
             epoch_start_time = time.time()
 
             for i, (inputs, labels) in enumerate(self.train_loader):
+                # Move data to the selected device
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
                 # Clear gradients
                 self.optimizer.zero_grad()
 
@@ -314,6 +403,7 @@ class SentimentAnalysisSystem:
                 # Save model if validation loss improved
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
+                    # Save model state dictionary (device-agnostic)
                     torch.save(self.model.state_dict(), self.config['model_save_path'])
                     print(f"Model saved to {self.config['model_save_path']}")
 
@@ -321,6 +411,7 @@ class SentimentAnalysisSystem:
                     self.save_config()
             else:
                 # If no validation set, save model after each epoch
+                # Save model state dictionary (device-agnostic)
                 torch.save(self.model.state_dict(), self.config['model_save_path'])
                 print(f"Model saved to {self.config['model_save_path']}")
 
@@ -357,6 +448,9 @@ class SentimentAnalysisSystem:
 
         with torch.no_grad():
             for inputs, labels in data_loader:
+                # Move data to the selected device
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
                 # Forward pass
                 outputs = self.model(inputs)
 
@@ -388,11 +482,14 @@ class SentimentAnalysisSystem:
 
         print("\nEvaluating model on test data...")
 
-        # Load the best model
+        # Load the best model state dictionary (device-agnostic loading)
         if os.path.exists(self.config['model_save_path']):
-            self.model.load_state_dict(torch.load(self.config['model_save_path']))
+            # Load the state_dict and then load it into the model
+            state_dict = torch.load(self.config['model_save_path'], map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            print(f"Model state loaded from {self.config['model_save_path']} and mapped to {self.device}")
         else:
-            print(f"Warning: Model file {self.config['model_save_path']} not found. Using current model.")
+            print(f"Warning: Model file {self.config['model_save_path']} not found. Using current model on device: {self.device}")
 
         # Evaluate on test set
         test_loss, test_accuracy = self.evaluate(self.test_loader)
@@ -407,8 +504,12 @@ class SentimentAnalysisSystem:
         self.model.eval()
         with torch.no_grad():
             for inputs, labels in self.test_loader:
+                 # Move data to the selected device
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+
                 outputs = self.model(inputs)
                 _, preds = torch.max(outputs, 1)
+                # Move predictions and labels back to CPU for numpy conversion
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
@@ -465,9 +566,12 @@ class SentimentAnalysisSystem:
         # Ensure model is in evaluation mode
         self.model.eval()
 
-        # Load the best model if available
+        # Load the best model state dictionary if available
         if os.path.exists(self.config['model_save_path']):
-            self.model.load_state_dict(torch.load(self.config['model_save_path']))
+             # Load the state_dict and then load it into the model
+            state_dict = torch.load(self.config['model_save_path'], map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            # print(f"Model state loaded from {self.config['model_save_path']} and mapped to {self.device}") # Optional: uncomment for verbose output
 
         # Tokenize the input text
         encoding = self.tokenizer(
@@ -478,17 +582,21 @@ class SentimentAnalysisSystem:
             return_tensors="pt"
         )
 
+        # Move input tensor to the selected device
+        input_ids = encoding.input_ids.to(self.device)
+
         # Make prediction
         with torch.no_grad():
-            outputs = self.model(encoding.input_ids)
+            outputs = self.model(input_ids)
             probabilities = torch.softmax(outputs, dim=1)
-            prediction = torch.argmax(probabilities, dim=1).item()
+            # Move probabilities back to CPU for numpy conversion and list conversion
+            prediction = torch.argmax(probabilities.cpu(), dim=1).item()
 
         # Convert prediction to class label
         class_label = self.config['class_names'][prediction]
 
-        # Extract probabilities
-        probs = probabilities[0].tolist()
+        # Extract probabilities (from CPU tensor)
+        probs = probabilities[0].cpu().tolist()
 
         # Create result dictionary with probabilities for each class
         result = {
@@ -596,6 +704,7 @@ class SentimentAnalysisSystem:
 
         # Reinitialize model if needed
         if reinitialize:
+            # Model will be moved to the currently set device in _initialize_model
             self._initialize_model()
             print("Model reinitialized with new configuration.")
 
@@ -611,9 +720,44 @@ def main():
     if os.path.exists("models/sentiment_config.json"):
         sentiment_system.load_config()
 
+    # --- Device Detection and Selection ---
+    print("\n" + "="*60)
+    print("Device Setup")
+    print("="*60)
+    print("Detecting available devices...")
+    available_devices = sentiment_system.detect_available_devices()
+    print(f"Available devices: {', '.join(available_devices)}")
+
+    if len(available_devices) > 1:
+        print("Please select a device for computation:")
+        for i, dev in enumerate(available_devices):
+            print(f"{i+1}. {dev}")
+        while True:
+            try:
+                device_choice_idx = int(input(f"Enter device number (1-{len(available_devices)}): ")) - 1
+                if 0 <= device_choice_idx < len(available_devices):
+                    selected_device_name = available_devices[device_choice_idx]
+                    sentiment_system.set_device(selected_device_name)
+                    break # Exit the device selection loop
+                else:
+                    print("Invalid device number. Please try again.")
+            except ValueError:
+                print("Invalid input. Please enter a number.")
+    elif available_devices:
+        # Only one device available (or just CPU), set it automatically
+        sentiment_system.set_device(available_devices[0])
+    else:
+        # No compatible devices found (shouldn't happen as CPU is always available)
+        print("No compatible devices found. Defaulting to CPU.")
+        sentiment_system.set_device("cpu")
+
+    print(f"Using device: {sentiment_system.device}")
+    # --- End Device Setup ---
+
+
     while True:
         print("\n" + "="*60)
-        print("Sentiment Analysis System")
+        print("Sentiment Analysis System Menu")
         print("="*60)
         print("1. Train Model")
         print("2. Test Model")
@@ -621,11 +765,12 @@ def main():
         print("4. Configure Dataset")
         print("5. Configure Model")
         print("6. Save/Load Configuration")
-        print("7. Exit")
+        print("7. Change Device") # Added option to change device
+        print("8. Exit")
         print("-"*60)
 
         try:
-            choice = int(input("Enter your choice (1-7): "))
+            choice = int(input("Enter your choice (1-8): ")) # Updated range
 
             if choice == 1:
                 # Train model
@@ -787,17 +932,47 @@ def main():
                     sentiment_system.load_config(config_path)
 
             elif choice == 7:
+                 # Change Device
+                print("\n" + "="*60)
+                print("Change Computation Device")
+                print("="*60)
+                available_devices = sentiment_system.detect_available_devices()
+                print(f"Available devices: {', '.join(available_devices)}")
+
+                if len(available_devices) > 1:
+                    print("Please select a device for computation:")
+                    for i, dev in enumerate(available_devices):
+                        print(f"{i+1}. {dev}")
+                    while True:
+                        try:
+                            device_choice_idx = int(input(f"Enter device number (1-{len(available_devices)}): ")) - 1
+                            if 0 <= device_choice_idx < len(available_devices):
+                                selected_device_name = available_devices[device_choice_idx]
+                                sentiment_system.set_device(selected_device_name)
+                                break # Exit the device selection loop
+                            else:
+                                print("Invalid device number. Please try again.")
+                        except ValueError:
+                            print("Invalid input. Please enter a number.")
+                elif available_devices:
+                    print("Only one device available.")
+                else:
+                     print("No compatible devices found.")
+
+
+            elif choice == 8: # Updated exit choice
                 # Exit the program
                 print("Exiting the program. Goodbye!")
                 break
 
             else:
-                print("Invalid choice. Please enter a number between 1 and 7.")
+                print("Invalid choice. Please enter a number between 1 and 8.") # Updated range
 
         except ValueError:
             print("Invalid input. Please enter a valid number.")
         except Exception as e:
-            print(f"An error occurred: {str(e)}")
+            print(f"An error occurred: {e}")
+            # Optional: Add more specific error handling based on potential issues
 
 if __name__ == "__main__":
     main()
