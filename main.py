@@ -14,8 +14,8 @@ import time # Import the time module
 # Import DirectML backend if available
 _directml_available = False
 try:
-    import torch.backends.directml
-    _directml_available = torch.backends.directml.is_available()
+    import torch_directml
+    _directml_available = torch_directml.is_available()
 except ImportError:
     _directml_available = False
     print("Warning: torch_directml not installed. DirectML backend will not be available.")
@@ -136,7 +136,7 @@ class SentimentAnalysisSystem:
             # DirectML devices are typically indexed starting from 0
             try:
                 # Check if any DirectML device is actually initialized
-                dml_device_count = torch.backends.directml.device_count()
+                dml_device_count = torch_directml.device_count()
                 if dml_device_count > 0:
                      available_devices.append("dml")
                      print(f"DirectML available: {dml_device_count} device(s)")
@@ -170,6 +170,8 @@ class SentimentAnalysisSystem:
         elif device_name not in ["cpu", "cuda", "dml"]:
              print(f"Warning: Unknown device '{device_name}'. Setting device to CPU.")
              self.device = torch.device("cpu")
+        elif device_name == "dml" and _directml_available:
+            self.device = torch_directml.device()
         else:
             self.device = torch.device(device_name)
 
